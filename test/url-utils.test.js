@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { normalizeHttpUrl } from "../src/url-utils.js";
+import {
+  normalizeHttpUrl,
+  resolveDiscoveredUrl
+} from "../src/url-utils.js";
 
 test("normalizeHttpUrl keeps valid https URLs", () => {
   assert.equal(
@@ -19,4 +22,21 @@ test("normalizeHttpUrl rejects non-http protocols", () => {
 
 test("normalizeHttpUrl rejects malformed URLs", () => {
   assert.throws(() => normalizeHttpUrl("not a url"), /target URL is invalid/i);
+});
+
+test("resolveDiscoveredUrl resolves relative links and strips fragments", () => {
+  assert.equal(
+    resolveDiscoveredUrl(
+      "https://example.com/catalog/index.html",
+      "../products/widget-1#overview"
+    ),
+    "https://example.com/products/widget-1"
+  );
+});
+
+test("resolveDiscoveredUrl ignores non-http discovery targets", () => {
+  assert.equal(
+    resolveDiscoveredUrl("https://example.com/catalog/index.html", "javascript:void(0)"),
+    null
+  );
 });

@@ -17,7 +17,7 @@ const VERIFICATION_PATTERNS = [
   },
   {
     label: "access denied",
-    pattern: /access denied|request blocked/iu
+    pattern: /access denied|request blocked|access is temporarily denied|suspected to be a web crawler|疑似爬虫|访问异常/iu
   },
   {
     label: "人机验证",

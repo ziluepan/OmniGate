@@ -13,3 +13,34 @@ export function normalizeHttpUrl(rawUrl) {
 
   return parsedUrl.toString();
 }
+
+export function resolveDiscoveredUrl(baseUrl, rawUrl) {
+  if (typeof rawUrl !== "string" || rawUrl.trim().length === 0) {
+    return null;
+  }
+
+  try {
+    const parsedUrl = new URL(rawUrl, baseUrl);
+
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      return null;
+    }
+
+    parsedUrl.hash = "";
+    return parsedUrl.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function isSameOriginUrl(leftUrl, rightUrl) {
+  return new URL(leftUrl).origin === new URL(rightUrl).origin;
+}
+
+export function extractUrlHostname(rawUrl) {
+  return new URL(rawUrl).hostname;
+}
+
+export function extractUrlPathname(rawUrl) {
+  return new URL(rawUrl).pathname;
+}

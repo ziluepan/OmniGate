@@ -3,3 +3,4 @@ node_modules
 .crawler-auth.json
 coverage
 tmp
+spider

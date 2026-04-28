@@ -1,3 +1,30 @@
+async function safeEvaluate(page, fn, ...args) {
+  const maxRetries = 3;
+  let lastError;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await page.evaluate(fn, ...args);
+    } catch (error) {
+      lastError = error;
+      if (
+        error instanceof Error &&
+        /execution context was destroyed/i.test(error.message)
+      ) {
+        // Wait for the page to settle after a navigation
+        await page.waitForLoadState("networkidle", {
+          timeout: 5000
+        }).catch(() => {});
+        await page.waitForTimeout(1000 * (attempt + 1));
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
 function snapshotEvaluator() {
   function truncate(rawText, maxLength) {
     return rawText.length <= maxLength
@@ -69,6 +96,44 @@ function snapshotEvaluator() {
       .slice(0, limit);
   }
 
+  function collectDiscoveredLinks(limit = 250) {
+    const seenLinks = new Set();
+    const discoveredLinks = [];
+
+    for (const anchor of document.querySelectorAll("a[href]")) {
+      const rawHref = anchor.getAttribute("href");
+
+      if (!rawHref) {
+        continue;
+      }
+
+      try {
+        const parsedUrl = new URL(rawHref, window.location.href);
+
+        if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+          continue;
+        }
+
+        parsedUrl.hash = "";
+
+        if (seenLinks.has(parsedUrl.href)) {
+          continue;
+        }
+
+        seenLinks.add(parsedUrl.href);
+        discoveredLinks.push(parsedUrl.href);
+
+        if (discoveredLinks.length >= limit) {
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return discoveredLinks;
+  }
+
   const candidateElements = Array.from(
     document.querySelectorAll(
       "main, article, section, [role='main'], [role='article'], table, ul, ol, div"
@@ -111,6 +176,7 @@ function snapshotEvaluator() {
         text: truncate((element.textContent ?? "").replace(/\s+/gu, " ").trim(), 120),
         href: element.href
       })),
+    discoveredLinks: collectDiscoveredLinks(),
     sectionCandidates: candidateElements,
     visibleText: truncate(
       (document.body?.innerText ?? "").replace(/\s+/gu, " ").trim(),
@@ -120,11 +186,11 @@ function snapshotEvaluator() {
 }
 
 export async function capturePageSnapshot(page) {
-  return page.evaluate(snapshotEvaluator);
+  return safeEvaluate(page, snapshotEvaluator);
 }
 
 export async function collectSectionsBySelectors(page, selectors) {
-  return page.evaluate((rawSelectors) => {
+  return safeEvaluate(page, (rawSelectors) => {
     function truncate(rawText, maxLength) {
       return rawText.length <= maxLength
         ? rawText
@@ -165,7 +231,7 @@ export async function collectSectionsBySelectors(page, selectors) {
 }
 
 export async function dismissNuisanceOverlays(page) {
-  await page.evaluate(() => {
+  await safeEvaluate(page, () => {
     function isVisible(element) {
       const style = window.getComputedStyle(element);
       const rect = element.getBoundingClientRect();

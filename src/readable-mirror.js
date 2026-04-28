@@ -62,6 +62,45 @@ function deriveHeadings(markdown) {
     .slice(0, 12);
 }
 
+function extractMarkdownLinks(markdown, baseUrl) {
+  const discoveredLinks = [];
+  const seenLinks = new Set();
+  const linkPattern = /\[[^\]]*\]\(([^)]+)\)/gu;
+
+  for (const match of markdown.matchAll(linkPattern)) {
+    const rawUrl = match[1]?.trim();
+
+    if (!rawUrl) {
+      continue;
+    }
+
+    try {
+      const parsedUrl = new URL(rawUrl, baseUrl);
+
+      if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+        continue;
+      }
+
+      parsedUrl.hash = "";
+
+      if (seenLinks.has(parsedUrl.href)) {
+        continue;
+      }
+
+      seenLinks.add(parsedUrl.href);
+      discoveredLinks.push(parsedUrl.href);
+
+      if (discoveredLinks.length >= 250) {
+        break;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return discoveredLinks;
+}
+
 function buildSnapshotFromReadableMirror({ requestedUrl, mirrorUrl, parsed }) {
   const cleanedMarkdown = stripMarkdownDecorators(parsed.markdown);
   const visibleText = collapseWhitespace(cleanedMarkdown);
@@ -75,6 +114,10 @@ function buildSnapshotFromReadableMirror({ requestedUrl, mirrorUrl, parsed }) {
     buttonTexts: [],
     iframeSources: [],
     linkSamples: [],
+    discoveredLinks: extractMarkdownLinks(
+      parsed.markdown,
+      parsed.sourceUrl || requestedUrl
+    ),
     sectionCandidates: [
       {
         selector: "markdown-body",

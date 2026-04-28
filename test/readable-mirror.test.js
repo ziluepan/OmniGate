@@ -74,4 +74,38 @@ test("ReadableMirrorSnapshotProvider fetches a mirror snapshot for blocked publi
   assert.equal(result.snapshot.title, "一世之尊-第732章 无耻小孟（求月票）-69书吧");
   assert.match(result.snapshot.visibleText, /爱潜水的乌贼/u);
   assert.equal(result.snapshot.headings[0], "第732章 无耻小孟（求月票）");
+  assert.deepEqual(result.snapshot.discoveredLinks, []);
+});
+
+test("ReadableMirrorSnapshotProvider extracts discoverable markdown links", async () => {
+  const provider = new ReadableMirrorSnapshotProvider(
+    {
+      enabled: true,
+      baseUrl: "https://r.jina.ai/http://",
+      timeoutMs: 5000
+    },
+    async () => ({
+      ok: true,
+      async text() {
+        return [
+          "Title: 文档目录",
+          "",
+          "URL Source: https://example.com/docs/start",
+          "",
+          "Markdown Content:",
+          "- [入门指南](/docs/getting-started)",
+          "- [产品页](https://example.com/products/widget-1#buy)"
+        ].join("\n")
+      }
+    })
+  );
+
+  const result = await provider.fetch({
+    url: "https://example.com/docs/start"
+  });
+
+  assert.deepEqual(result.snapshot.discoveredLinks, [
+    "https://example.com/docs/getting-started",
+    "https://example.com/products/widget-1"
+  ]);
 });

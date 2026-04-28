@@ -44,18 +44,72 @@ export async function createPlaywrightSession({
   return {
     async navigate(url) {
       await page.goto(url, {
-        waitUntil: "domcontentloaded"
+        waitUntil: "load",
+        timeout: navigationTimeoutMs
       });
 
       await page.waitForLoadState("networkidle", {
-        timeout: 5000
+        timeout: 10000
       }).catch(() => {});
+
+      // Wait a short moment for late client-side redirects/navigations to settle
+      await page.waitForTimeout(1500);
+
+      // Smoke test: verify the execution context is still alive
+      try {
+        await page.evaluate(() => true);
+      } catch {
+        // If the context was destroyed by a late navigation, wait for it to
+        // settle and confirm stability
+        await page.waitForLoadState("networkidle", {
+          timeout: 10000
+        }).catch(() => {});
+        await page.waitForTimeout(2000);
+      }
     },
     async dismissNuisanceOverlays() {
       await dismissNuisanceOverlays(page);
     },
     async captureSnapshot() {
       return capturePageSnapshot(page);
+    },
+    async executePreActions(preActions = []) {
+      for (const action of preActions) {
+        try {
+          switch (action) {
+            case "scrollToBottom":
+              await page.evaluate(() => {
+                window.scrollTo(0, document.body.scrollHeight);
+              });
+              await page.waitForTimeout(500);
+              break;
+            case "dismissOverlays":
+              await dismissNuisanceOverlays(page);
+              break;
+            case "waitForLazyLoad":
+              // Scroll down in steps to trigger lazy loading
+              await page.evaluate(async () => {
+                const distance = window.innerHeight / 2;
+                const maxScroll = document.body.scrollHeight;
+                let scrolled = 0;
+
+                for (let i = 0; scrolled < maxScroll && i < 10; i++) {
+                  window.scrollBy(0, distance);
+                  scrolled += distance;
+                  await new Promise((r) => setTimeout(r, 300));
+                }
+
+                window.scrollTo(0, 0);
+              });
+              break;
+            default:
+              // Unknown action, ignore
+              break;
+          }
+        } catch {
+          // Pre-actions are best-effort
+        }
+      }
     },
     async waitForManualVerification({ timeoutMs }) {
       const deadline = Date.now() + timeoutMs;
