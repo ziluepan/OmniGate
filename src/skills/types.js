@@ -23,6 +23,8 @@
  * @typedef {Object} Skill
  * @property {string} name - 唯一标识
  * @property {string} description - 描述
+ * @property {number} [priority] - 匹配优先级，数值越大越优先
+ * @property {string[]} [tags] - skill 标签，用于分类和调试
  * @property {function(userQuery: string, snapshot: Object): boolean|{match: boolean, params: Object}} matchIntent - 意图匹配函数
  * @property {WaitStrategy} [waitStrategy] - 导航后的等待策略
  * @property {string[]} [preActions] - 页面预处理动作列表

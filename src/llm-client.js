@@ -67,6 +67,7 @@ function buildStructurePrompts({ userQuery, snapshot, skillExtractStrategy }) {
     "你是网页结构分析器。",
     "只基于给定的页面摘要判断哪些区域最可能包含用户要的信息。",
     "不要假设你能绕过登录、验证码或任何安全校验。",
+    "如果页面信息分散、摘要不足、或候选区块不可靠，可以自主选择 full_text，而不是被局部选择器限制。",
     "只输出 JSON，格式为：",
     '{"targetSectionSelectors":["css selector"],"extractionMode":"sections|full_text","outputShape":"object|array|text","reason":"简短说明"}'
   ];
@@ -93,7 +94,12 @@ function buildStructurePrompts({ userQuery, snapshot, skillExtractStrategy }) {
     }
 
     if (hints.length > 0) {
-      systemLines.push("", "--- 场景特定建议 ---", ...hints);
+      systemLines.push(
+        "",
+        "--- 场景特定建议 ---",
+        "这些建议只是提示，不是硬约束。如果它们与页面实际结构不符，请以你的判断为准。",
+        ...hints
+      );
     }
   }
 
@@ -132,6 +138,8 @@ function buildExtractionPrompts({
     "根据用户目标，从提供的网页正文中完整提取结果，不要省略或截断任何内容。",
     "如果用户要小说内容，就把章节正文原样返回，不要总结、不要省略。",
     "如果内容不足，就尽量返回能确认的字段，不要编造。",
+    "已选区块和场景提示只是辅助信息，不是硬约束。",
+    "如果区块不完整、提示不准确、或页面类型与预判不一致，以你的实际判断为准，并优先参考页面全文。",
     '只输出 JSON，格式为：{"answer": 数据提取结果, "confidence": 0.95, "notes": ["可选说明"]}',
     '注意：answer 字段的数据类型必须与 extraction plan 中的 outputShape 匹配。如果是 text，answer 就是一个长字符串；如果是 array，就是数组；否则是对象。',
     "对于 text 类型的 answer，请返回完整的原文内容，不要截断。"
@@ -154,7 +162,10 @@ function buildExtractionPrompts({
         {
           url: snapshot?.url ?? "",
           title: snapshot?.title ?? "",
-          headings: snapshot?.headings ?? []
+          metaDescription: snapshot?.metaDescription ?? "",
+          headings: snapshot?.headings ?? [],
+          sectionCandidates: snapshot?.sectionCandidates ?? [],
+          linkSamples: snapshot?.linkSamples ?? []
         },
         null,
         2
@@ -241,7 +252,10 @@ export class OpenAiCompatibleAiClient {
       skillExtractStrategy
     });
 
-    return this.#requestJson(prompts);
+    return this.#requestJson({
+      ...prompts,
+      operationName: "Analyzing page structure"
+    });
   }
 
   async extractContent({ userQuery, snapshot, plan, sections, extractionPrompt }) {
@@ -253,7 +267,10 @@ export class OpenAiCompatibleAiClient {
       extractionPrompt
     });
 
-    return this.#requestJson(prompts);
+    return this.#requestJson({
+      ...prompts,
+      operationName: "Extracting content"
+    });
   }
 
   async analyzeUserIntent({ userQuery, snapshot, skillDescriptions }) {
@@ -263,7 +280,10 @@ export class OpenAiCompatibleAiClient {
       skillDescriptions
     });
 
-    return this.#requestJson(prompts);
+    return this.#requestJson({
+      ...prompts,
+      operationName: "Analyzing user intent"
+    });
   }
 
   async synthesizeCrawlResults({ startUrl, userQuery, pages }) {
@@ -273,14 +293,37 @@ export class OpenAiCompatibleAiClient {
       pages
     });
 
-    return this.#requestJson(prompts);
+    return this.#requestJson({
+      ...prompts,
+      operationName: "Synthesizing crawl results"
+    });
   }
 
-  async #requestJson({ systemPrompt, userPrompt }) {
+  #emitStatus(message) {
+    if (typeof this.config.onStatus === "function") {
+      this.config.onStatus(message);
+    }
+  }
+
+  async #requestJson({ systemPrompt, userPrompt, operationName = "AI request" }) {
     const abortController = new AbortController();
     const timeoutHandle = setTimeout(() => {
       abortController.abort();
     }, this.config.aiTimeoutMs);
+    const progressIntervalMs =
+      Number.isInteger(this.config.aiProgressIntervalMs) &&
+      this.config.aiProgressIntervalMs > 0
+        ? this.config.aiProgressIntervalMs
+        : 10000;
+    let progressTimer = null;
+
+    this.#emitStatus(`${operationName} started.`);
+
+    if (progressIntervalMs > 0) {
+      progressTimer = setInterval(() => {
+        this.#emitStatus(`${operationName}: still waiting for the model response...`);
+      }, progressIntervalMs);
+    }
 
     try {
       const response = await this.fetchImplementation(this.config.aiApiUrl, {
@@ -321,8 +364,19 @@ export class OpenAiCompatibleAiClient {
       const modelText = extractMessageText(payload);
       const jsonText = extractJsonText(modelText);
 
+      this.#emitStatus(`${operationName} completed.`);
       return JSON.parse(jsonText);
+    } catch (error) {
+      this.#emitStatus(
+        `${operationName} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      throw error;
     } finally {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+      }
       clearTimeout(timeoutHandle);
     }
   }

@@ -12,6 +12,8 @@ test("parseArguments supports spider-style crawl flags", () => {
     "https://example.com",
     "--query",
     "汇总产品",
+    "--tool",
+    "crawl",
     "--crawl",
     "--max-pages",
     "12",
@@ -30,6 +32,7 @@ test("parseArguments supports spider-style crawl flags", () => {
   ]);
 
   assert.equal(parsed.crawl, true);
+  assert.equal(parsed.tool, "crawl");
   assert.equal(parsed.maxPages, 12);
   assert.equal(parsed.maxDepth, 3);
   assert.deepEqual(parsed.includePatterns, ["*products*", "*articles*"]);
@@ -40,6 +43,18 @@ test("parseArguments supports spider-style crawl flags", () => {
 });
 
 test("validateCliArguments rejects invalid crawl values", () => {
+  assert.throws(
+    () =>
+      validateCliArguments({
+        headful: true,
+        manualAuth: false,
+        tool: "unknown",
+        maxPages: 1,
+        maxDepth: 1
+      }),
+    /--tool must be one of/u
+  );
+
   assert.throws(
     () =>
       validateCliArguments({

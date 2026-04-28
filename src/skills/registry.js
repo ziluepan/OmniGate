@@ -59,39 +59,58 @@ export class SkillRegistry {
    * @returns {{ skill: import("./types.js").Skill, params: Object }}
    */
   matchIntent({ userQuery, snapshot, llmIntent }) {
-    const url = snapshot?.url ?? "";
-    const title = snapshot?.title ?? "";
+    const genericSkill =
+      this.skills.find((skill) => skill.name === "generic-page") ?? null;
+    const llmMatchedSkill = llmIntent?.skill
+      ? this.skills.find((skill) => skill.name === llmIntent.skill) ?? null
+      : null;
 
-    // 如果 LLM 已经分析了意图，先尝试精确匹配 skill 名称
-    if (llmIntent?.skill) {
-      const exactMatch = this.skills.find(
-        (s) => s.name === llmIntent.skill
-      );
-
-      if (exactMatch) {
-        return { skill: exactMatch, params: llmIntent.params ?? {} };
-      }
+    if (llmMatchedSkill && llmMatchedSkill.name !== "generic-page") {
+      return { skill: llmMatchedSkill, params: llmIntent.params ?? {} };
     }
 
-    // 否则按顺序尝试每个 skill 的 matchIntent
+    const matchedSkills = [];
+
     for (const skill of this.skills) {
+      if (skill.name === "generic-page") {
+        continue;
+      }
+
       if (typeof skill.matchIntent === "function") {
         const matchResult = skill.matchIntent(userQuery, snapshot);
 
         if (typeof matchResult === "object" && matchResult.match) {
-          return { skill, params: matchResult.params ?? {} };
+          matchedSkills.push({
+            skill,
+            params: matchResult.params ?? {}
+          });
         }
 
         if (matchResult === true) {
-          return { skill, params: {} };
+          matchedSkills.push({
+            skill,
+            params: {}
+          });
         }
       }
     }
 
-    // Fallback: 返回 generic-page skill
-    const generic = this.skills.find((s) => s.name === "generic-page");
+    if (matchedSkills.length > 0) {
+      const prioritizedMatch = [...matchedSkills].sort((leftMatch, rightMatch) => {
+        const leftPriority = leftMatch.skill.priority ?? 0;
+        const rightPriority = rightMatch.skill.priority ?? 0;
 
-    return { skill: generic ?? null, params: {} };
+        return rightPriority - leftPriority;
+      })[0];
+
+      return prioritizedMatch;
+    }
+
+    if (llmMatchedSkill) {
+      return { skill: llmMatchedSkill, params: llmIntent.params ?? {} };
+    }
+
+    return { skill: genericSkill, params: {} };
   }
 
   /**

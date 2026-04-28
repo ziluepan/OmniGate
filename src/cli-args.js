@@ -1,3 +1,8 @@
+import {
+  normalizeTaskToolName,
+  TASK_TOOL_NAMES
+} from "./task-router.js";
+
 function readOptionalInteger(rawValue) {
   if (rawValue === undefined) {
     return undefined;
@@ -67,6 +72,12 @@ export function parseArguments(argv) {
       continue;
     }
 
+    if (currentValue === "--tool") {
+      parsed.tool = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
     if (currentValue === "--max-pages") {
       parsed.maxPages = readOptionalInteger(argv[index + 1]);
       index += 1;
@@ -125,6 +136,15 @@ export function parseArguments(argv) {
 }
 
 export function validateCliArguments(argumentsObject) {
+  if (
+    argumentsObject.tool !== undefined &&
+    normalizeTaskToolName(argumentsObject.tool) === null
+  ) {
+    throw new Error(
+      `--tool must be one of: ${Object.values(TASK_TOOL_NAMES).join(", ")}`
+    );
+  }
+
   if (argumentsObject.manualAuth && !argumentsObject.headful) {
     throw new Error("--manual-auth requires --headful so you can complete verification.");
   }

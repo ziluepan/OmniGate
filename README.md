@@ -6,7 +6,20 @@
 
 ## 🎯 核心能力
 
+- **Spider 风格工具层：**
+  - 内置 `extract / full_content / links / crawl` 四类工具。
+  - 入口会按任务自动路由到最合适的工具，不再默认所有问题都走同一条抽取链路。
+  - 支持显式覆盖：`--tool extract|full_content|links|crawl`。
+- **内置页面 Skills：**
+  - `listing-page`：列表页、搜索结果页、目录页，偏向数组输出。
+  - `product-detail`：商品详情页，偏向价格、规格、库存、卖点等结构化字段。
+  - `documentation-page`：文档/API 页面，偏向步骤、参数、示例、注意事项。
+  - `article-page`：文章、博客、新闻页，偏向标题、作者、发布时间、正文。
+  - `discussion-thread`：论坛贴、问答、讨论页，偏向楼主内容和高质量回复。
+  - `novel-chapter`：小说章节页，偏向全文原样返回。
+  - `generic-page`：兜底通用 skill。
 - **智能提炼：** 支持对任意网页的上下文分析，根据你的中文 Prompt 自然语言提问，返回精准的 JSON 结构化抽取结果。
+- **浏览器失败自动降级：** 如果 Playwright/Chrome 在当前环境无法启动，会自动退回到本地 HTTP snapshot 抓取，公开博客和文档页不再直接因为浏览器挂掉而失败。
 - **Spider 风格站点级 Crawl：**
   - 内置 `frontier` 优先级队列，优先抓取更像正文/商品/文章的 URL。
   - 支持去重、同源限制、深度限制、包含/排除规则、多路由预算控制。
@@ -58,6 +71,12 @@ CRAWLER_BROWSER_EXECUTABLE_PATH=/usr/bin/google-chrome# 留空则使用内置沙
 npm start -- --url https://example.com --query "提取这页出现的商品标题、价格和主要卖点"
 ```
 
+也可以显式指定走抽取工具：
+
+```bash
+npm start -- --url https://example.com --query "提取标题和价格" --tool extract
+```
+
 ### 2. 半自动 Debug / 手动解封
 
 如果自带的 Stealth 技术无法瞒过更新的反爬墙，你可以显式命令它打开有头模式。这时候如果卡在了盾前，你可以在浏览器视窗里手动点过去：
@@ -72,6 +91,12 @@ npm start -- --url https://example.com --query "分析结构" --headful --manual
 
 ```bash
 npm start -- --url https://example.com --query "汇总站内商品标题和价格" --crawl --max-pages 20 --max-depth 2
+```
+
+或者显式走 `crawl` 工具：
+
+```bash
+npm start -- --url https://example.com --query "汇总站内商品标题和价格" --tool crawl --max-pages 20 --max-depth 2
 ```
 
 只保留某些路径，并排除低价值页面：
@@ -92,14 +117,25 @@ npm start -- --url https://example.com --query "汇总站点文章标题" --craw
 npm start -- --url https://example.com --query "汇总合作站点入口" --crawl --allow-external --round-robin-domains
 ```
 
+### 4. 只取链接，不做正文抽取
+
+```bash
+npm start -- --url https://example.com/docs --query "列出这页所有链接" --tool links
+```
+
+如果不显式指定，像“列出这页所有链接”这样的查询也会自动路由到 `links`。
+
 ## 🧠 当前架构
 
-现在项目分成两层：
+现在项目分成三层：
 
+- **任务工具路由层：** 根据用户请求在 `extract / full_content / links / crawl` 之间做选择。
 - **单页智能抽取层：** 浏览器打开页面、处理验证、生成结构摘要、调用 AI 抽取。
 - **站点级调度层：** `frontier + 去重 + 深度/预算/规则控制 + 结果汇总`，这部分吸收了 `spider` 项目的核心设计思路。
 
-这意味着项目不再只是“打开一个页面问 AI”，而是可以像真正的 crawler 一样控制抓取边界和站点遍历策略。
+这意味着项目不再只是“打开一个页面问 AI”，而是先判断当前问题该调用哪类工具，再执行对应的抓取链路。
+
+在单页抓取里，还会先经过 skill 匹配层：根据 URL、标题和用户查询挑选最合适的页面 skill，再把该 skill 的选择器、输出形状和提取提示注入给 LLM。
 
 ## 💡 开发与扩展（高级测试）
 

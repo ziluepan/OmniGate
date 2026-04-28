@@ -4,6 +4,10 @@ import {
   CrawlBudgetTracker,
   evaluateDiscoveredUrl
 } from "./crawl-policy.js";
+import {
+  decideTaskTool,
+  TASK_TOOL_NAMES
+} from "./task-router.js";
 import { detectVerificationSignals } from "./verification.js";
 import { resolveDiscoveredUrl } from "./url-utils.js";
 import { analyzeUserIntent } from "./intent-analyzer.js";
@@ -61,6 +65,24 @@ function resolveDirectContent(snapshot) {
   };
 }
 
+function detectVerification(snapshot, registry) {
+  let verification = detectVerificationSignals(snapshot);
+
+  if (registry && !verification.blocked) {
+    const registryDetection = registry.detectVerification(snapshot);
+
+    if (registryDetection.blocked) {
+      verification = {
+        blocked: true,
+        signals: [registryDetection.type],
+        reason: `Detected ${registryDetection.type} verification`
+      };
+    }
+  }
+
+  return verification;
+}
+
 /**
  * Select the best skill for this page based on user intent.
  *
@@ -73,6 +95,23 @@ function resolveDirectContent(snapshot) {
 async function selectPageSkill({ registry, aiClient, url, userQuery }) {
   if (!registry) {
     return null;
+  }
+
+  let ruleMatchedSkill = null;
+
+  try {
+    const match = registry.matchIntent({
+      userQuery,
+      snapshot: { url }
+    });
+
+    ruleMatchedSkill = match.skill ?? null;
+
+    if (ruleMatchedSkill?.name && ruleMatchedSkill.name !== "generic-page") {
+      return ruleMatchedSkill;
+    }
+  } catch {
+    ruleMatchedSkill = null;
   }
 
   try {
@@ -90,19 +129,16 @@ async function selectPageSkill({ registry, aiClient, url, userQuery }) {
       llmIntent: intent
     });
 
-    return match.skill ?? null;
-  } catch (firstError) {
-    // If LLM matching fails, try rule-based matching
-    try {
-      const snapshot = { url };
-      const match = registry.matchIntent({ userQuery, snapshot });
-      return match.skill ?? null;
-    } catch {
-      console.warn(
-        `[aicrawler] Skill matching failed for ${url}: both LLM and rule-based matching failed`
-      );
-      return null;
+    return match.skill ?? ruleMatchedSkill ?? null;
+  } catch {
+    if (ruleMatchedSkill) {
+      return ruleMatchedSkill;
     }
+
+    console.warn(
+      `[aicrawler] Skill matching failed for ${url}: both LLM and rule-based matching failed`
+    );
+    return null;
   }
 }
 
@@ -129,20 +165,7 @@ async function resolveVerification({
   collectSections,
   registry
 }) {
-  // Classification: use registry verification skills if available, otherwise legacy
-  let verification = detectVerificationSignals(snapshot);
-
-  if (registry && !verification.blocked) {
-    const registryDetection = registry.detectVerification(snapshot);
-
-    if (registryDetection.blocked) {
-      verification = {
-        blocked: true,
-        signals: [registryDetection.type],
-        reason: `Detected ${registryDetection.type} verification`
-      };
-    }
-  }
+  let verification = detectVerification(snapshot, registry);
 
   // Tier 1: auto-solve (Cloudflare Turnstile)
   if (
@@ -155,7 +178,7 @@ async function resolveVerification({
 
     if (unlockedSnapshot) {
       snapshot = unlockedSnapshot;
-      verification = detectVerificationSignals(snapshot);
+      verification = detectVerification(snapshot, registry);
     }
   }
 
@@ -172,7 +195,7 @@ async function resolveVerification({
 
     if (unlockedSnapshot) {
       snapshot = unlockedSnapshot;
-      verification = detectVerificationSignals(snapshot);
+      verification = detectVerification(snapshot, registry);
     }
   }
 
@@ -194,7 +217,7 @@ async function resolveVerification({
         typeof fallbackContext.collectSections === "function"
           ? fallbackContext.collectSections.bind(fallbackContext)
           : null;
-      verification = detectVerificationSignals(snapshot);
+      verification = detectVerification(snapshot, registry);
     }
   }
 
@@ -245,7 +268,184 @@ async function runExtractionPipeline({
   return { plan, extractionResult };
 }
 
-async function processPageWithSession({
+function buildDirectExtractionPlan({ selectedSkill, activeSource }) {
+  const configuredOutputShape =
+    selectedSkill?.extractStrategy?.outputShape;
+  const outputShape =
+    configuredOutputShape === "array" || configuredOutputShape === "text"
+      ? configuredOutputShape
+      : "object";
+
+  return {
+    targetSectionSelectors: [],
+    extractionMode: "full_text",
+    outputShape,
+    reason:
+      activeSource === "browser"
+        ? "Direct full-text extraction requested."
+        : `Direct full-text extraction from ${activeSource} snapshot.`
+  };
+}
+
+async function runDirectExtractionPipeline({
+  aiClient,
+  snapshot,
+  url,
+  userQuery,
+  selectedSkill,
+  activeSource
+}) {
+  const plan = buildDirectExtractionPlan({
+    selectedSkill,
+    activeSource
+  });
+  const extractionResult = await aiClient.extractContent({
+    url: snapshot?.url ?? url,
+    userQuery,
+    snapshot,
+    plan,
+    sections: [],
+    extractionPrompt: selectedSkill?.extractionPrompt
+  });
+
+  return { plan, extractionResult };
+}
+
+function createBrowserUnavailableError(url) {
+  return new Error(
+    `Browser session is unavailable for ${url}; falling back to snapshot providers.`
+  );
+}
+
+async function resolvePageContextFromFallback({
+  fallbackSnapshotProvider,
+  url,
+  userQuery,
+  resolvedOptions,
+  selectedSkill,
+  browserError,
+  registry
+}) {
+  if (typeof fallbackSnapshotProvider?.fetch !== "function") {
+    throw browserError ??
+      new Error(`Unable to capture ${url}: no browser session or fallback provider available.`);
+  }
+
+  const fallbackContext = await fallbackSnapshotProvider.fetch({
+    url,
+    blockedSnapshot: null,
+    userQuery,
+    browserError
+  });
+
+  if (!fallbackContext?.snapshot) {
+    throw browserError ??
+      new Error(`Unable to capture ${url}: fallback snapshot provider returned no content.`);
+  }
+
+  const verification = detectVerification(
+    fallbackContext.snapshot,
+    registry
+  );
+
+  return {
+    resolvedOptions,
+    selectedSkill,
+    snapshot: fallbackContext.snapshot,
+    activeSource:
+      typeof fallbackContext.source === "string"
+        ? fallbackContext.source
+        : "fallback",
+    collectSections:
+      typeof fallbackContext.collectSections === "function"
+        ? fallbackContext.collectSections.bind(fallbackContext)
+        : null,
+    blocked: verification.blocked,
+    verification
+  };
+}
+
+async function resolvePageContextWithSession({
+  session,
+  fallbackSnapshotProvider,
+  url,
+  userQuery,
+  resolvedOptions,
+  selectedSkill,
+  registry
+}) {
+  if (!session) {
+    return resolvePageContextFromFallback({
+      fallbackSnapshotProvider,
+      url,
+      userQuery,
+      resolvedOptions,
+      selectedSkill,
+      browserError: createBrowserUnavailableError(url),
+      registry
+    });
+  }
+
+  try {
+    await session.navigate(url);
+
+    if (
+      selectedSkill &&
+      Array.isArray(selectedSkill.preActions) &&
+      selectedSkill.preActions.length > 0 &&
+      typeof session.executePreActions === "function"
+    ) {
+      await session.executePreActions(selectedSkill.preActions);
+    } else if (typeof session.dismissNuisanceOverlays === "function") {
+      await session.dismissNuisanceOverlays();
+    }
+
+    let snapshot = await session.captureSnapshot();
+    let activeSource = "browser";
+    let collectSections =
+      typeof session.collectSections === "function"
+        ? session.collectSections.bind(session)
+        : null;
+
+    const resolution = await resolveVerification({
+      snapshot,
+      session,
+      fallbackSnapshotProvider,
+      url,
+      userQuery,
+      resolvedOptions,
+      activeSource,
+      collectSections,
+      registry
+    });
+
+    snapshot = resolution.snapshot;
+    activeSource = resolution.activeSource;
+    collectSections = resolution.collectSections;
+
+    return {
+      resolvedOptions,
+      selectedSkill,
+      snapshot,
+      activeSource,
+      collectSections,
+      blocked: resolution.blocked,
+      verification: resolution.verification
+    };
+  } catch (browserError) {
+    return resolvePageContextFromFallback({
+      fallbackSnapshotProvider,
+      url,
+      userQuery,
+      resolvedOptions,
+      selectedSkill,
+      browserError,
+      registry
+    });
+  }
+}
+
+async function resolvePageContext({
   session,
   fallbackSnapshotProvider,
   aiClient,
@@ -262,7 +462,6 @@ async function processPageWithSession({
     ...options
   };
 
-  // Layer 1: Intent analysis → skill selection
   const selectedSkill = await selectPageSkill({
     registry,
     aiClient,
@@ -270,56 +469,62 @@ async function processPageWithSession({
     userQuery
   });
 
-  await session.navigate(url);
-
-  // Layer 2: Skill-driven preActions or legacy dismiss
-  if (
-    selectedSkill &&
-    Array.isArray(selectedSkill.preActions) &&
-    selectedSkill.preActions.length > 0 &&
-    typeof session.executePreActions === "function"
-  ) {
-    await session.executePreActions(selectedSkill.preActions);
-  } else if (typeof session.dismissNuisanceOverlays === "function") {
-    await session.dismissNuisanceOverlays();
-  }
-
-  let snapshot = await session.captureSnapshot();
-  let activeSource = "browser";
-  let collectSections =
-    typeof session.collectSections === "function"
-      ? session.collectSections.bind(session)
-      : null;
-
-  // Layer 3: Verification resolution
-  const resolution = await resolveVerification({
-    snapshot,
+  return resolvePageContextWithSession({
     session,
     fallbackSnapshotProvider,
+    resolvedOptions,
+    selectedSkill,
     url,
     userQuery,
-    resolvedOptions,
-    activeSource,
-    collectSections,
     registry
   });
+}
 
-  if (resolution.blocked) {
+async function processPageWithSession({
+  session,
+  fallbackSnapshotProvider,
+  aiClient,
+  url,
+  userQuery,
+  options = {},
+  registry
+}) {
+  const pageContext = await resolvePageContext({
+    session,
+    fallbackSnapshotProvider,
+    registry,
+    aiClient,
+    url,
+    userQuery,
+    options
+  });
+  const {
+    resolvedOptions,
+    selectedSkill,
+    snapshot,
+    activeSource,
+    collectSections,
+    blocked,
+    verification
+  } = pageContext;
+
+  if (blocked) {
     return {
-      snapshot: resolution.snapshot,
+      snapshot,
       result: {
         status: "blocked",
-        url: resolution.snapshot?.url ?? url,
-        title: resolution.snapshot?.title ?? "",
-        reason: resolution.verification.reason,
-        signals: resolution.verification.signals
+        url: snapshot?.url ?? url,
+        title: snapshot?.title ?? "",
+        reason: verification.reason,
+        signals: verification.signals
       }
     };
   }
 
-  snapshot = resolution.snapshot;
-  activeSource = resolution.activeSource;
-  collectSections = resolution.collectSections;
+  const shouldUseDirectExtraction =
+    activeSource !== "browser" &&
+    typeof snapshot?.fullVisibleText === "string" &&
+    snapshot.fullVisibleText.length > 0;
 
   // Direct content mode: return without AI
   if (resolvedOptions.returnFullContent) {
@@ -342,20 +547,30 @@ async function processPageWithSession({
         contentFormat: directContent.format,
         contentLength: directContent.content.length,
         data: directContent.content,
-        confidence: null
+        confidence: null,
+        mode: TASK_TOOL_NAMES.FULL_CONTENT,
+        tool: TASK_TOOL_NAMES.FULL_CONTENT
       }
     };
   }
 
-  // AI extraction pipeline with skill hints
-  const { plan, extractionResult } = await runExtractionPipeline({
-    aiClient,
-    snapshot,
-    url,
-    userQuery,
-    collectSections,
-    selectedSkill
-  });
+  const { plan, extractionResult } = shouldUseDirectExtraction
+    ? await runDirectExtractionPipeline({
+        aiClient,
+        snapshot,
+        url,
+        userQuery,
+        selectedSkill,
+        activeSource
+      })
+    : await runExtractionPipeline({
+        aiClient,
+        snapshot,
+        url,
+        userQuery,
+        collectSections,
+        selectedSkill
+      });
 
   if (
     resolvedOptions.persistStorageState &&
@@ -376,7 +591,9 @@ async function processPageWithSession({
       confidence:
         typeof extractionResult?.confidence === "number"
           ? extractionResult.confidence
-          : null
+          : null,
+      mode: TASK_TOOL_NAMES.EXTRACT,
+      tool: TASK_TOOL_NAMES.EXTRACT
     }
   };
 }
@@ -488,6 +705,60 @@ export async function runCrawlerWorkflow({
     });
 
     return result;
+  } finally {
+    await closeSession(session);
+  }
+}
+
+export async function runLinksWorkflow({
+  session,
+  fallbackSnapshotProvider,
+  aiClient,
+  url,
+  userQuery,
+  options = {},
+  registry
+}) {
+  try {
+    const pageContext = await resolvePageContext({
+      session,
+      fallbackSnapshotProvider,
+      aiClient,
+      url,
+      userQuery,
+      options,
+      registry
+    });
+
+    if (pageContext.blocked) {
+      return {
+        status: "blocked",
+        url: pageContext.snapshot?.url ?? url,
+        title: pageContext.snapshot?.title ?? "",
+        reason: pageContext.verification.reason,
+        signals: pageContext.verification.signals,
+        mode: TASK_TOOL_NAMES.LINKS,
+        tool: TASK_TOOL_NAMES.LINKS
+      };
+    }
+
+    const links = Array.isArray(pageContext.snapshot?.discoveredLinks)
+      ? pageContext.snapshot.discoveredLinks
+      : [];
+
+    return {
+      status: "ok",
+      url: pageContext.snapshot?.url ?? url,
+      title: pageContext.snapshot?.title ?? "",
+      contentSource: pageContext.activeSource,
+      data: {
+        links,
+        count: links.length
+      },
+      confidence: null,
+      mode: TASK_TOOL_NAMES.LINKS,
+      tool: TASK_TOOL_NAMES.LINKS
+    };
   } finally {
     await closeSession(session);
   }
@@ -625,6 +896,7 @@ export async function runSiteCrawlerWorkflow({
             ? "blocked"
             : "error",
       mode: "crawl",
+      tool: TASK_TOOL_NAMES.CRAWL,
       url,
       title: successfulPages[0]?.title ?? pages[0]?.title ?? "",
       contentSource: "crawl",
@@ -642,4 +914,93 @@ export async function runSiteCrawlerWorkflow({
   } finally {
     await closeSession(session);
   }
+}
+
+export async function runTaskWorkflow({
+  session,
+  fallbackSnapshotProvider,
+  aiClient,
+  url,
+  userQuery,
+  explicitTool,
+  crawl = false,
+  options = {},
+  crawlOptions = {},
+  registry
+}) {
+  const toolDecision = decideTaskTool({
+    userQuery,
+    explicitTool,
+    crawl,
+    fullContent: options.returnFullContent
+  });
+
+  if (toolDecision.tool === TASK_TOOL_NAMES.CRAWL) {
+    return {
+      ...(await runSiteCrawlerWorkflow({
+        session,
+        fallbackSnapshotProvider,
+        aiClient,
+        url,
+        userQuery,
+        options,
+        crawlOptions,
+        registry
+      })),
+      toolDecision
+    };
+  }
+
+  if (toolDecision.tool === TASK_TOOL_NAMES.LINKS) {
+    return {
+      ...(await runLinksWorkflow({
+        session,
+        fallbackSnapshotProvider,
+        aiClient,
+        url,
+        userQuery,
+        options,
+        registry
+      })),
+      toolDecision
+    };
+  }
+
+  if (toolDecision.tool === TASK_TOOL_NAMES.FULL_CONTENT) {
+    return {
+      ...(await runCrawlerWorkflow({
+        session,
+        fallbackSnapshotProvider,
+        aiClient,
+        url,
+        userQuery,
+        options: {
+          ...options,
+          returnFullContent: true
+        },
+        registry
+      })),
+      mode: TASK_TOOL_NAMES.FULL_CONTENT,
+      tool: TASK_TOOL_NAMES.FULL_CONTENT,
+      toolDecision
+    };
+  }
+
+  return {
+    ...(await runCrawlerWorkflow({
+      session,
+      fallbackSnapshotProvider,
+      aiClient,
+      url,
+      userQuery,
+      options: {
+        ...options,
+        returnFullContent: false
+      },
+      registry
+    })),
+    mode: TASK_TOOL_NAMES.EXTRACT,
+    tool: TASK_TOOL_NAMES.EXTRACT,
+    toolDecision
+  };
 }
