@@ -33,7 +33,36 @@ function normalizeExtractionPlan(rawPlan) {
   };
 }
 
-async function closeSession(session) {
+function createSessionRuntime({ session = null, getSession = null } = {}) {
+  return {
+    session,
+    getSession:
+      typeof getSession === "function" ? getSession : null
+  };
+}
+
+async function ensureSession(sessionRuntime) {
+  if (sessionRuntime?.session) {
+    return sessionRuntime.session;
+  }
+
+  if (typeof sessionRuntime?.getSession !== "function") {
+    return null;
+  }
+
+  const createdSession = await sessionRuntime.getSession();
+  sessionRuntime.session = createdSession ?? null;
+  return sessionRuntime.session;
+}
+
+async function closeSession(sessionOrRuntime) {
+  const session =
+    sessionOrRuntime &&
+    typeof sessionOrRuntime === "object" &&
+    "session" in sessionOrRuntime
+      ? sessionOrRuntime.session
+      : sessionOrRuntime;
+
   if (typeof session?.close !== "function") {
     return;
   }
@@ -81,6 +110,101 @@ function detectVerification(snapshot, registry) {
   }
 
   return verification;
+}
+
+function buildSectionCollectionOptions(plan) {
+  const isTextOutput = plan?.outputShape === "text";
+
+  return {
+    maxMatches: isTextOutput ? 40 : 5,
+    maxTextLength: isTextOutput ? 120000 : 12000,
+    mergeMatches: isTextOutput,
+    preserveFormatting: isTextOutput
+  };
+}
+
+async function collectPlanSections({ collectSections, plan }) {
+  if (
+    typeof collectSections !== "function" ||
+    !Array.isArray(plan?.targetSectionSelectors) ||
+    plan.targetSectionSelectors.length === 0
+  ) {
+    return [];
+  }
+
+  return collectSections(
+    plan.targetSectionSelectors,
+    buildSectionCollectionOptions(plan)
+  );
+}
+
+function getSnapshotTextLength(snapshot) {
+  if (typeof snapshot?.fullVisibleText === "string") {
+    return snapshot.fullVisibleText.trim().length;
+  }
+
+  if (typeof snapshot?.visibleText === "string") {
+    return snapshot.visibleText.trim().length;
+  }
+
+  return 0;
+}
+
+function hasUsefulFocusedSections(sections, plan) {
+  if (!Array.isArray(sections) || sections.length === 0) {
+    return false;
+  }
+
+  if (plan?.outputShape === "text") {
+    const combinedLength = sections.reduce(
+      (sum, section) =>
+        sum +
+        (typeof section?.text === "string" ? section.text.trim().length : 0),
+      0
+    );
+
+    return combinedLength >= 500;
+  }
+
+  return sections.some(
+    (section) =>
+      typeof section?.text === "string" && section.text.trim().length >= 20
+  );
+}
+
+function shouldUseFallbackPageContext(
+  pageContext,
+  {
+    canCreateBrowserSession = false
+  } = {}
+) {
+  const { snapshot, activeSource, resolvedOptions } = pageContext;
+  const textLength = getSnapshotTextLength(snapshot);
+  const hasSectionCandidates =
+    Array.isArray(snapshot?.sectionCandidates) &&
+    snapshot.sectionCandidates.length > 0;
+
+  if (!snapshot) {
+    return false;
+  }
+
+  if (pageContext.blocked) {
+    return !canCreateBrowserSession;
+  }
+
+  if (resolvedOptions.returnFullContent) {
+    return textLength > 0;
+  }
+
+  if (activeSource === "readable_mirror") {
+    return !canCreateBrowserSession;
+  }
+
+  if (activeSource === "http_fetch") {
+    return textLength > 0 || hasSectionCandidates;
+  }
+
+  return textLength > 0 || hasSectionCandidates;
 }
 
 /**
@@ -231,11 +355,11 @@ async function resolveVerification({
 }
 
 /**
- * Run the AI extraction pipeline: analyze structure → collect sections → extract content.
+ * Run the first half of the AI extraction pipeline: analyze structure → collect sections.
  *
- * Uses skill hints (extractStrategy, extractionPrompt) when a skill is selected.
+ * Uses skill hints (extractStrategy) when a skill is selected.
  */
-async function runExtractionPipeline({
+async function runStructurePipeline({
   aiClient,
   snapshot,
   url,
@@ -251,12 +375,24 @@ async function runExtractionPipeline({
       skillExtractStrategy: selectedSkill?.extractStrategy
     })
   );
-  const sections =
-    plan.targetSectionSelectors.length > 0 &&
-    typeof collectSections === "function"
-      ? await collectSections(plan.targetSectionSelectors)
-      : [];
-  const extractionResult = await aiClient.extractContent({
+  const sections = await collectPlanSections({
+    collectSections,
+    plan
+  });
+
+  return { plan, sections };
+}
+
+async function runContentExtraction({
+  aiClient,
+  snapshot,
+  url,
+  userQuery,
+  plan,
+  sections,
+  selectedSkill
+}) {
+  return aiClient.extractContent({
     url: snapshot?.url ?? url,
     userQuery,
     snapshot,
@@ -264,51 +400,6 @@ async function runExtractionPipeline({
     sections,
     extractionPrompt: selectedSkill?.extractionPrompt
   });
-
-  return { plan, extractionResult };
-}
-
-function buildDirectExtractionPlan({ selectedSkill, activeSource }) {
-  const configuredOutputShape =
-    selectedSkill?.extractStrategy?.outputShape;
-  const outputShape =
-    configuredOutputShape === "array" || configuredOutputShape === "text"
-      ? configuredOutputShape
-      : "object";
-
-  return {
-    targetSectionSelectors: [],
-    extractionMode: "full_text",
-    outputShape,
-    reason:
-      activeSource === "browser"
-        ? "Direct full-text extraction requested."
-        : `Direct full-text extraction from ${activeSource} snapshot.`
-  };
-}
-
-async function runDirectExtractionPipeline({
-  aiClient,
-  snapshot,
-  url,
-  userQuery,
-  selectedSkill,
-  activeSource
-}) {
-  const plan = buildDirectExtractionPlan({
-    selectedSkill,
-    activeSource
-  });
-  const extractionResult = await aiClient.extractContent({
-    url: snapshot?.url ?? url,
-    userQuery,
-    snapshot,
-    plan,
-    sections: [],
-    extractionPrompt: selectedSkill?.extractionPrompt
-  });
-
-  return { plan, extractionResult };
 }
 
 function createBrowserUnavailableError(url) {
@@ -318,7 +409,7 @@ function createBrowserUnavailableError(url) {
 }
 
 async function resolvePageContextFromFallback({
-  fallbackSnapshotProvider,
+  snapshotProvider,
   url,
   userQuery,
   resolvedOptions,
@@ -326,12 +417,12 @@ async function resolvePageContextFromFallback({
   browserError,
   registry
 }) {
-  if (typeof fallbackSnapshotProvider?.fetch !== "function") {
+  if (typeof snapshotProvider?.fetch !== "function") {
     throw browserError ??
       new Error(`Unable to capture ${url}: no browser session or fallback provider available.`);
   }
 
-  const fallbackContext = await fallbackSnapshotProvider.fetch({
+  const fallbackContext = await snapshotProvider.fetch({
     url,
     blockedSnapshot: null,
     userQuery,
@@ -366,7 +457,7 @@ async function resolvePageContextFromFallback({
 }
 
 async function resolvePageContextWithSession({
-  session,
+  sessionRuntime,
   fallbackSnapshotProvider,
   url,
   userQuery,
@@ -374,9 +465,25 @@ async function resolvePageContextWithSession({
   selectedSkill,
   registry
 }) {
+  let session = null;
+
+  try {
+    session = await ensureSession(sessionRuntime);
+  } catch (browserError) {
+    return resolvePageContextFromFallback({
+      snapshotProvider: fallbackSnapshotProvider,
+      url,
+      userQuery,
+      resolvedOptions,
+      selectedSkill,
+      browserError,
+      registry
+    });
+  }
+
   if (!session) {
     return resolvePageContextFromFallback({
-      fallbackSnapshotProvider,
+      snapshotProvider: fallbackSnapshotProvider,
       url,
       userQuery,
       resolvedOptions,
@@ -434,7 +541,7 @@ async function resolvePageContextWithSession({
     };
   } catch (browserError) {
     return resolvePageContextFromFallback({
-      fallbackSnapshotProvider,
+      snapshotProvider: fallbackSnapshotProvider,
       url,
       userQuery,
       resolvedOptions,
@@ -446,7 +553,8 @@ async function resolvePageContextWithSession({
 }
 
 async function resolvePageContext({
-  session,
+  sessionRuntime,
+  initialSnapshotProvider,
   fallbackSnapshotProvider,
   aiClient,
   url,
@@ -459,18 +567,87 @@ async function resolvePageContext({
     persistStorageState: false,
     manualAuthTimeoutMs: 120000,
     returnFullContent: false,
+    skipSkillSelection: false,
     ...options
   };
 
-  const selectedSkill = await selectPageSkill({
-    registry,
-    aiClient,
-    url,
-    userQuery
-  });
+  const selectedSkill =
+    resolvedOptions.returnFullContent || resolvedOptions.skipSkillSelection
+      ? null
+      : await selectPageSkill({
+          registry,
+          aiClient,
+          url,
+          userQuery
+        });
+
+  const canCreateBrowserSession =
+    Boolean(sessionRuntime?.session) ||
+    typeof sessionRuntime?.getSession === "function";
+  const primarySnapshotProvider =
+    initialSnapshotProvider ?? fallbackSnapshotProvider;
+
+  let fallbackPageContext = null;
+
+  const shouldAttemptFallbackFirst =
+    !sessionRuntime?.session && primarySnapshotProvider;
+
+  if (shouldAttemptFallbackFirst) {
+    try {
+      fallbackPageContext = await resolvePageContextFromFallback({
+        snapshotProvider: primarySnapshotProvider,
+        url,
+        userQuery,
+        resolvedOptions,
+        selectedSkill,
+        browserError: canCreateBrowserSession
+          ? null
+          : createBrowserUnavailableError(url),
+        registry
+      });
+
+      if (
+        shouldUseFallbackPageContext(fallbackPageContext, {
+          canCreateBrowserSession
+        })
+      ) {
+        return fallbackPageContext;
+      }
+
+      if (!canCreateBrowserSession) {
+        return fallbackPageContext;
+      }
+    } catch {
+      fallbackPageContext = null;
+    }
+  }
+
+  if (canCreateBrowserSession) {
+    try {
+      return await resolvePageContextWithSession({
+        sessionRuntime,
+        fallbackSnapshotProvider,
+        resolvedOptions,
+        selectedSkill,
+        url,
+        userQuery,
+        registry
+      });
+    } catch (browserError) {
+      if (fallbackPageContext) {
+        return fallbackPageContext;
+      }
+
+      throw browserError;
+    }
+  }
+
+  if (fallbackPageContext) {
+    return fallbackPageContext;
+  }
 
   return resolvePageContextWithSession({
-    session,
+    sessionRuntime,
     fallbackSnapshotProvider,
     resolvedOptions,
     selectedSkill,
@@ -481,7 +658,8 @@ async function resolvePageContext({
 }
 
 async function processPageWithSession({
-  session,
+  sessionRuntime,
+  initialSnapshotProvider,
   fallbackSnapshotProvider,
   aiClient,
   url,
@@ -490,7 +668,8 @@ async function processPageWithSession({
   registry
 }) {
   const pageContext = await resolvePageContext({
-    session,
+    sessionRuntime,
+    initialSnapshotProvider,
     fallbackSnapshotProvider,
     registry,
     aiClient,
@@ -521,20 +700,15 @@ async function processPageWithSession({
     };
   }
 
-  const shouldUseDirectExtraction =
-    activeSource !== "browser" &&
-    typeof snapshot?.fullVisibleText === "string" &&
-    snapshot.fullVisibleText.length > 0;
-
   // Direct content mode: return without AI
   if (resolvedOptions.returnFullContent) {
     const directContent = resolveDirectContent(snapshot);
 
     if (
       resolvedOptions.persistStorageState &&
-      typeof session.saveStorageState === "function"
+      typeof sessionRuntime?.session?.saveStorageState === "function"
     ) {
-      await session.saveStorageState();
+      await sessionRuntime.session.saveStorageState();
     }
 
     return {
@@ -554,38 +728,89 @@ async function processPageWithSession({
     };
   }
 
-  const { plan, extractionResult } = shouldUseDirectExtraction
-    ? await runDirectExtractionPipeline({
-        aiClient,
-        snapshot,
-        url,
-        userQuery,
-        selectedSkill,
-        activeSource
-      })
-    : await runExtractionPipeline({
-        aiClient,
-        snapshot,
-        url,
-        userQuery,
-        collectSections,
-        selectedSkill
-      });
+  let currentPageContext = pageContext;
+  let currentSnapshot = snapshot;
+  let currentActiveSource = activeSource;
+  let currentCollectSections = collectSections;
+
+  let { plan, sections } = await runStructurePipeline({
+    aiClient,
+    snapshot: currentSnapshot,
+    url,
+    userQuery,
+    collectSections: currentCollectSections,
+    selectedSkill
+  });
+
+  if (
+    currentActiveSource === "http_fetch" &&
+    typeof sessionRuntime?.getSession === "function" &&
+    (
+      plan.extractionMode !== "sections" ||
+      !hasUsefulFocusedSections(sections, plan)
+    )
+  ) {
+    currentPageContext = await resolvePageContextWithSession({
+      sessionRuntime,
+      fallbackSnapshotProvider,
+      resolvedOptions,
+      selectedSkill,
+      url,
+      userQuery,
+      registry
+    });
+
+    if (currentPageContext.blocked) {
+      return {
+        snapshot: currentPageContext.snapshot,
+        result: {
+          status: "blocked",
+          url: currentPageContext.snapshot?.url ?? url,
+          title: currentPageContext.snapshot?.title ?? "",
+          reason: currentPageContext.verification.reason,
+          signals: currentPageContext.verification.signals
+        }
+      };
+    }
+
+    currentSnapshot = currentPageContext.snapshot;
+    currentActiveSource = currentPageContext.activeSource;
+    currentCollectSections = currentPageContext.collectSections;
+
+    ({ plan, sections } = await runStructurePipeline({
+      aiClient,
+      snapshot: currentSnapshot,
+      url,
+      userQuery,
+      collectSections: currentCollectSections,
+      selectedSkill
+    }));
+  }
+
+  const extractionResult = await runContentExtraction({
+    aiClient,
+    snapshot: currentSnapshot,
+    url,
+    userQuery,
+    plan,
+    sections,
+    selectedSkill
+  });
 
   if (
     resolvedOptions.persistStorageState &&
-    typeof session.saveStorageState === "function"
+    typeof sessionRuntime?.session?.saveStorageState === "function"
   ) {
-    await session.saveStorageState();
+    await sessionRuntime.session.saveStorageState();
   }
 
   return {
-    snapshot,
+    snapshot: currentSnapshot,
     result: {
       status: "ok",
-      url: snapshot?.url ?? url,
-      title: snapshot?.title ?? "",
-      contentSource: activeSource,
+      url: currentSnapshot?.url ?? url,
+      title: currentSnapshot?.title ?? "",
+      contentSource: currentActiveSource,
       plan,
       data: extractionResult?.answer ?? null,
       confidence:
@@ -686,6 +911,8 @@ function averageConfidence(pages) {
 
 export async function runCrawlerWorkflow({
   session,
+  getSession,
+  initialSnapshotProvider,
   fallbackSnapshotProvider,
   aiClient,
   url,
@@ -693,9 +920,15 @@ export async function runCrawlerWorkflow({
   options = {},
   registry
 }) {
+  const sessionRuntime = createSessionRuntime({
+    session,
+    getSession
+  });
+
   try {
     const { result } = await processPageWithSession({
-      session,
+      sessionRuntime,
+      initialSnapshotProvider,
       fallbackSnapshotProvider,
       aiClient,
       url,
@@ -706,12 +939,14 @@ export async function runCrawlerWorkflow({
 
     return result;
   } finally {
-    await closeSession(session);
+    await closeSession(sessionRuntime);
   }
 }
 
 export async function runLinksWorkflow({
   session,
+  getSession,
+  initialSnapshotProvider,
   fallbackSnapshotProvider,
   aiClient,
   url,
@@ -719,14 +954,23 @@ export async function runLinksWorkflow({
   options = {},
   registry
 }) {
+  const sessionRuntime = createSessionRuntime({
+    session,
+    getSession
+  });
+
   try {
     const pageContext = await resolvePageContext({
-      session,
+      sessionRuntime,
+      initialSnapshotProvider,
       fallbackSnapshotProvider,
       aiClient,
       url,
       userQuery,
-      options,
+      options: {
+        ...options,
+        skipSkillSelection: true
+      },
       registry
     });
 
@@ -760,12 +1004,14 @@ export async function runLinksWorkflow({
       tool: TASK_TOOL_NAMES.LINKS
     };
   } finally {
-    await closeSession(session);
+    await closeSession(sessionRuntime);
   }
 }
 
 export async function runSiteCrawlerWorkflow({
   session,
+  getSession,
+  initialSnapshotProvider,
   fallbackSnapshotProvider,
   aiClient,
   url,
@@ -774,6 +1020,10 @@ export async function runSiteCrawlerWorkflow({
   crawlOptions = {},
   registry
 }) {
+  const sessionRuntime = createSessionRuntime({
+    session,
+    getSession
+  });
   const resolvedCrawlOptions = {
     maxPages:
       Number.isInteger(crawlOptions.maxPages) && crawlOptions.maxPages > 0
@@ -824,7 +1074,8 @@ export async function runSiteCrawlerWorkflow({
 
       try {
         const { snapshot, result } = await processPageWithSession({
-          session,
+          sessionRuntime,
+          initialSnapshotProvider,
           fallbackSnapshotProvider,
           aiClient,
           url: currentEntry.url,
@@ -912,12 +1163,14 @@ export async function runSiteCrawlerWorkflow({
           : averageConfidence(successfulPages)
     };
   } finally {
-    await closeSession(session);
+    await closeSession(sessionRuntime);
   }
 }
 
 export async function runTaskWorkflow({
   session,
+  getSession,
+  initialSnapshotProvider,
   fallbackSnapshotProvider,
   aiClient,
   url,
@@ -939,6 +1192,8 @@ export async function runTaskWorkflow({
     return {
       ...(await runSiteCrawlerWorkflow({
         session,
+        getSession,
+        initialSnapshotProvider,
         fallbackSnapshotProvider,
         aiClient,
         url,
@@ -955,6 +1210,8 @@ export async function runTaskWorkflow({
     return {
       ...(await runLinksWorkflow({
         session,
+        getSession,
+        initialSnapshotProvider,
         fallbackSnapshotProvider,
         aiClient,
         url,
@@ -970,6 +1227,8 @@ export async function runTaskWorkflow({
     return {
       ...(await runCrawlerWorkflow({
         session,
+        getSession,
+        initialSnapshotProvider,
         fallbackSnapshotProvider,
         aiClient,
         url,
@@ -989,6 +1248,8 @@ export async function runTaskWorkflow({
   return {
     ...(await runCrawlerWorkflow({
       session,
+      getSession,
+      initialSnapshotProvider,
       fallbackSnapshotProvider,
       aiClient,
       url,

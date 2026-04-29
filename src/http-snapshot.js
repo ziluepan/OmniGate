@@ -6,6 +6,17 @@ function collapseWhitespace(rawText) {
   return rawText.replace(/\s+/gu, " ").trim();
 }
 
+function normalizeStructuredText(rawText) {
+  return rawText
+    .replace(/\r/gu, "")
+    .replace(/\u00a0/gu, " ")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/gu, ""))
+    .join("\n")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+}
+
 function decodeHtmlEntities(rawText) {
   const namedEntities = {
     amp: "&",
@@ -79,6 +90,57 @@ function stripHtmlToText(rawHtml) {
       )
       .replace(/<[^>]+>/gu, " ")
   );
+}
+
+function stripCodeGutters(rawHtml) {
+  return rawHtml.replace(
+    /<(td|div|span|pre)\b[^>]*class=(["'])[^"']*\b(gutter|line-numbers?|hljs-ln-numbers?|rouge-gutter)\b[^"']*\2[^>]*>[\s\S]*?<\/\1>/giu,
+    ""
+  );
+}
+
+function renderPreformattedText(rawHtml) {
+  return normalizeStructuredText(
+    decodeHtmlEntities(
+      stripCodeGutters(rawHtml)
+        .replace(/<br\s*\/?>/giu, "\n")
+        .replace(/<\/(div|p|li|tr|td|th)>/giu, "\n")
+        .replace(/<[^>]+>/gu, "")
+    )
+  );
+}
+
+function renderStructuredTextFromHtml(rawHtml) {
+  const codeBlocks = [];
+  const preparedHtml = stripCodeGutters(rawHtml).replace(
+    /<pre\b[^>]*>([\s\S]*?)<\/pre>/giu,
+    (_fullMatch, innerHtml) => {
+      const marker = `AICRAWLER_PRE_BLOCK_${codeBlocks.length}`;
+      codeBlocks.push(renderPreformattedText(innerHtml));
+      return `\n${marker}\n`;
+    }
+  );
+
+  let renderedText = decodeHtmlEntities(
+    preparedHtml
+      .replace(/<!--[\s\S]*?-->/gu, " ")
+      .replace(
+        /<(script|style|noscript|template|svg|canvas)[^>]*>[\s\S]*?<\/\1>/giu,
+        " "
+      )
+      .replace(/<br\s*\/?>/giu, "\n")
+      .replace(
+        /<\/(address|article|aside|blockquote|div|dl|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|section|table|tbody|td|tfoot|th|thead|tr|ul)>/giu,
+        "\n"
+      )
+      .replace(/<[^>]+>/gu, "")
+  );
+
+  codeBlocks.forEach((codeBlock, index) => {
+    renderedText = renderedText.replace(`AICRAWLER_PRE_BLOCK_${index}`, codeBlock);
+  });
+
+  return normalizeStructuredText(renderedText);
 }
 
 function normalizeFullText(rawText) {
@@ -159,7 +221,7 @@ function extractSectionText(html, tagName) {
     return "";
   }
 
-  return normalizeFullText(stripHtmlToText(sectionMatch[1]));
+  return renderStructuredTextFromHtml(sectionMatch[1]);
 }
 
 function extractLinks(html, baseUrl) {
@@ -214,8 +276,46 @@ function extractLinks(html, baseUrl) {
   };
 }
 
-function buildSectionCandidates(fullVisibleText, articleText, mainText) {
+function buildTextBlocks(fullVisibleText, maxBlocks = 8) {
+  const paragraphs = fullVisibleText
+    .split(/\n{2,}/u)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => paragraph.length >= 20);
+
+  const blocks = [];
+  let currentParagraphs = [];
+  let currentLength = 0;
+
+  for (const paragraph of paragraphs) {
+    const nextLength = currentLength + paragraph.length;
+
+    if (
+      currentParagraphs.length > 0 &&
+      (currentParagraphs.length >= 4 || nextLength >= 1400)
+    ) {
+      blocks.push(currentParagraphs.join("\n\n"));
+      currentParagraphs = [];
+      currentLength = 0;
+
+      if (blocks.length >= maxBlocks) {
+        break;
+      }
+    }
+
+    currentParagraphs = [...currentParagraphs, paragraph];
+    currentLength += paragraph.length;
+  }
+
+  if (blocks.length < maxBlocks && currentParagraphs.length > 0) {
+    blocks.push(currentParagraphs.join("\n\n"));
+  }
+
+  return blocks.slice(0, maxBlocks);
+}
+
+function buildSectionArtifacts(fullVisibleText, articleText, mainText) {
   const sectionCandidates = [];
+  const selectorTextEntries = [];
 
   if (articleText.length >= 80) {
     sectionCandidates.push({
@@ -223,6 +323,7 @@ function buildSectionCandidates(fullVisibleText, articleText, mainText) {
       tagName: "article",
       textSample: truncateText(articleText, 600)
     });
+    selectorTextEntries.push(["article", articleText]);
   }
 
   if (mainText.length >= 80) {
@@ -231,7 +332,20 @@ function buildSectionCandidates(fullVisibleText, articleText, mainText) {
       tagName: "main",
       textSample: truncateText(mainText, 600)
     });
+    selectorTextEntries.push(["main", mainText]);
   }
+
+  const textBlocks = buildTextBlocks(fullVisibleText);
+
+  textBlocks.forEach((blockText, index) => {
+    const selector = `http-block:${index + 1}`;
+    sectionCandidates.push({
+      selector,
+      tagName: "text_block",
+      textSample: truncateText(blockText, 600)
+    });
+    selectorTextEntries.push([selector, blockText]);
+  });
 
   if (fullVisibleText.length >= 80) {
     sectionCandidates.push({
@@ -239,34 +353,42 @@ function buildSectionCandidates(fullVisibleText, articleText, mainText) {
       tagName: "body",
       textSample: truncateText(fullVisibleText, 600)
     });
+    selectorTextEntries.push(["body", fullVisibleText]);
   }
 
-  return sectionCandidates;
+  return {
+    sectionCandidates,
+    selectorTextMap: new Map(selectorTextEntries)
+  };
 }
 
 function buildSnapshotFromHtml({ requestedUrl, responseUrl, html }) {
-  const fullVisibleText = normalizeFullText(stripHtmlToText(html));
+  const fullVisibleText = renderStructuredTextFromHtml(html);
   const articleText = extractSectionText(html, "article");
   const mainText = extractSectionText(html, "main");
   const { discoveredLinks, linkSamples } = extractLinks(html, responseUrl);
+  const { sectionCandidates, selectorTextMap } = buildSectionArtifacts(
+    fullVisibleText,
+    articleText,
+    mainText
+  );
 
   return {
-    url: responseUrl,
-    sourceUrl: requestedUrl,
-    title: extractTitle(html),
-    metaDescription: extractMetaDescription(html),
-    headings: extractHeadings(html),
-    buttonTexts: [],
-    iframeSources: [],
-    linkSamples,
-    discoveredLinks,
-    sectionCandidates: buildSectionCandidates(
+    snapshot: {
+      url: responseUrl,
+      sourceUrl: requestedUrl,
+      title: extractTitle(html),
+      metaDescription: extractMetaDescription(html),
+      headings: extractHeadings(html),
+      buttonTexts: [],
+      iframeSources: [],
+      linkSamples,
+      discoveredLinks,
+      sectionCandidates,
       fullVisibleText,
-      articleText,
-      mainText
-    ),
-    fullVisibleText,
-    visibleText: truncateText(collapseWhitespace(fullVisibleText), 12000)
+      visibleText: truncateText(collapseWhitespace(fullVisibleText), 12000)
+    },
+    selectorTextMap
   };
 }
 
@@ -317,16 +439,11 @@ export class DirectHttpSnapshotProvider {
       }
 
       const html = await response.text();
-      const snapshot = buildSnapshotFromHtml({
+      const { snapshot, selectorTextMap } = buildSnapshotFromHtml({
         requestedUrl: url,
         responseUrl: response.url || url,
         html
       });
-      const selectorTextMap = new Map([
-        ["article", extractSectionText(html, "article")],
-        ["main", extractSectionText(html, "main")],
-        ["body", snapshot.fullVisibleText]
-      ]);
 
       if (!snapshot.fullVisibleText) {
         return null;
@@ -335,7 +452,12 @@ export class DirectHttpSnapshotProvider {
       return {
         source: "http_fetch",
         snapshot,
-        async collectSections(selectors = []) {
+        async collectSections(selectors = [], options = {}) {
+          const maxTextLength =
+            Number.isInteger(options?.maxTextLength) && options.maxTextLength > 0
+              ? options.maxTextLength
+              : 4000;
+
           return selectors
             .map((selector) => {
               const text = selectorTextMap.get(selector);
@@ -343,7 +465,7 @@ export class DirectHttpSnapshotProvider {
               return text
                 ? {
                     selector,
-                    text
+                    text: truncateText(text, maxTextLength)
                   }
                 : null;
             })

@@ -32,6 +32,42 @@ function snapshotEvaluator() {
       : `${rawText.slice(0, maxLength)}…`;
   }
 
+  function compactText(rawText) {
+    return rawText.replace(/\s+/gu, " ").trim();
+  }
+
+  function normalizeStructuredText(rawText) {
+    return rawText
+      .replace(/\r/gu, "")
+      .replace(/\u00a0/gu, " ")
+      .split("\n")
+      .map((line) => line.replace(/[ \t]+$/gu, ""))
+      .join("\n")
+      .replace(/\n{3,}/gu, "\n\n")
+      .trim();
+  }
+
+  function removeCodeGutters(root) {
+    root.querySelectorAll(
+      ".gutter, .line-numbers, .line-numbers-rows, .hljs-ln-numbers, .rouge-gutter, td.gutter, pre.line-numbers"
+    ).forEach((element) => {
+      element.remove();
+    });
+  }
+
+  function extractElementText(element, { preserveFormatting = false } = {}) {
+    const workingElement = element.cloneNode(true);
+    removeCodeGutters(workingElement);
+
+    if (preserveFormatting) {
+      return normalizeStructuredText(
+        workingElement.innerText ?? workingElement.textContent ?? ""
+      );
+    }
+
+    return compactText(workingElement.textContent ?? "");
+  }
+
   function isVisible(element) {
     const style = window.getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -91,7 +127,7 @@ function snapshotEvaluator() {
   function textList(selector, limit = 20) {
     return Array.from(document.querySelectorAll(selector))
       .filter(isVisible)
-      .map((element) => element.textContent?.trim() ?? "")
+      .map((element) => compactText(element.textContent ?? ""))
       .filter(Boolean)
       .slice(0, limit);
   }
@@ -141,7 +177,7 @@ function snapshotEvaluator() {
   )
     .filter(isVisible)
     .map((element) => {
-      const textContent = (element.textContent ?? "").replace(/\s+/gu, " ").trim();
+      const textContent = extractElementText(element);
 
       return {
         element,
@@ -173,15 +209,12 @@ function snapshotEvaluator() {
       .filter(isVisible)
       .slice(0, 20)
       .map((element) => ({
-        text: truncate((element.textContent ?? "").replace(/\s+/gu, " ").trim(), 120),
+        text: truncate(compactText(element.textContent ?? ""), 120),
         href: element.href
       })),
     discoveredLinks: collectDiscoveredLinks(),
     sectionCandidates: candidateElements,
-    visibleText: truncate(
-      (document.body?.innerText ?? "").replace(/\s+/gu, " ").trim(),
-      12000
-    )
+    visibleText: truncate(compactText(document.body?.innerText ?? ""), 12000)
   };
 }
 
@@ -189,8 +222,8 @@ export async function capturePageSnapshot(page) {
   return safeEvaluate(page, snapshotEvaluator);
 }
 
-export async function collectSectionsBySelectors(page, selectors) {
-  return safeEvaluate(page, (rawSelectors) => {
+export async function collectSectionsBySelectors(page, selectors, options = {}) {
+  return safeEvaluate(page, (rawSelectors, rawOptions) => {
     function truncate(rawText, maxLength) {
       return rawText.length <= maxLength
         ? rawText
@@ -210,24 +243,83 @@ export async function collectSectionsBySelectors(page, selectors) {
       );
     }
 
+    const maxMatches =
+      Number.isInteger(rawOptions?.maxMatches) && rawOptions.maxMatches > 0
+        ? rawOptions.maxMatches
+        : 5;
+    const maxTextLength =
+      Number.isInteger(rawOptions?.maxTextLength) && rawOptions.maxTextLength > 0
+        ? rawOptions.maxTextLength
+        : 4000;
+    const mergeMatches = rawOptions?.mergeMatches === true;
+    const preserveFormatting = rawOptions?.preserveFormatting === true;
+
+    function compactText(rawText) {
+      return rawText.replace(/\s+/gu, " ").trim();
+    }
+
+    function normalizeStructuredText(rawText) {
+      return rawText
+        .replace(/\r/gu, "")
+        .replace(/\u00a0/gu, " ")
+        .split("\n")
+        .map((line) => line.replace(/[ \t]+$/gu, ""))
+        .join("\n")
+        .replace(/\n{3,}/gu, "\n\n")
+        .trim();
+    }
+
+    function removeCodeGutters(root) {
+      root.querySelectorAll(
+        ".gutter, .line-numbers, .line-numbers-rows, .hljs-ln-numbers, .rouge-gutter, td.gutter, pre.line-numbers"
+      ).forEach((element) => {
+        element.remove();
+      });
+    }
+
+    function extractElementText(element) {
+      const workingElement = element.cloneNode(true);
+      removeCodeGutters(workingElement);
+
+      if (preserveFormatting) {
+        return normalizeStructuredText(
+          workingElement.innerText ?? workingElement.textContent ?? ""
+        );
+      }
+
+      return compactText(workingElement.textContent ?? "");
+    }
+
     return rawSelectors.flatMap((selector) => {
       try {
-        return Array.from(document.querySelectorAll(selector))
+        const matchedTexts = Array.from(document.querySelectorAll(selector))
           .filter(isVisible)
-          .slice(0, 5)
-          .map((element) => ({
-            selector,
-            text: truncate(
-              (element.textContent ?? "").replace(/\s+/gu, " ").trim(),
-              4000
-            )
-          }))
-          .filter((entry) => entry.text.length > 0);
+          .slice(0, maxMatches)
+          .map((element) => extractElementText(element))
+          .filter((text) => text.length > 0);
+
+        if (matchedTexts.length === 0) {
+          return [];
+        }
+
+        if (mergeMatches) {
+          return [
+            {
+              selector,
+              text: truncate(matchedTexts.join("\n\n"), maxTextLength)
+            }
+          ];
+        }
+
+        return matchedTexts.map((text) => ({
+          selector,
+          text: truncate(text, maxTextLength)
+        }));
       } catch {
         return [];
       }
     });
-  }, selectors);
+  }, selectors, options);
 }
 
 export async function dismissNuisanceOverlays(page) {

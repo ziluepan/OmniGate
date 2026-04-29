@@ -193,15 +193,39 @@ export class ReadableMirrorSnapshotProvider {
         return null;
       }
 
+      const snapshot = buildSnapshotFromReadableMirror({
+        requestedUrl: url,
+        mirrorUrl,
+        parsed
+      });
+      const selectorTextMap = new Map([
+        ["markdown-body", snapshot.fullVisibleText],
+        ["article", snapshot.fullVisibleText],
+        ["main", snapshot.fullVisibleText],
+        ["body", snapshot.fullVisibleText]
+      ]);
+
       return {
         source: "readable_mirror",
-        snapshot: buildSnapshotFromReadableMirror({
-          requestedUrl: url,
-          mirrorUrl,
-          parsed
-        }),
-        async collectSections() {
-          return [];
+        snapshot,
+        async collectSections(selectors = [], options = {}) {
+          const maxTextLength =
+            Number.isInteger(options?.maxTextLength) && options.maxTextLength > 0
+              ? options.maxTextLength
+              : 4000;
+
+          return selectors
+            .map((selector) => {
+              const text = selectorTextMap.get(selector);
+
+              return text
+                ? {
+                    selector,
+                    text: truncateText(text, maxTextLength)
+                  }
+                : null;
+            })
+            .filter(Boolean);
         }
       };
     } catch {

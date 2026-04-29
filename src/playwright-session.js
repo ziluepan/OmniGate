@@ -161,8 +161,8 @@ export async function createPlaywrightSession({
 
       return null;
     },
-    async collectSections(selectors) {
-      return collectSectionsBySelectors(page, selectors);
+    async collectSections(selectors, options = {}) {
+      return collectSectionsBySelectors(page, selectors, options);
     },
     async saveStorageState() {
       if (!storageStatePath) {

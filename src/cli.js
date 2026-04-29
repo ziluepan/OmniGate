@@ -5,6 +5,10 @@ import {
   DirectHttpSnapshotProvider
 } from "./http-snapshot.js";
 import { OpenAiCompatibleAiClient } from "./llm-client.js";
+import {
+  formatRunResult,
+  writeRunResult
+} from "./output-writer.js";
 import { createPlaywrightSession } from "./playwright-session.js";
 import { ReadableMirrorSnapshotProvider } from "./readable-mirror.js";
 import { registerBuiltInSkills } from "./skills/bootstrap.js";
@@ -28,43 +32,27 @@ function printUsage() {
 `);
 }
 
-function printTextResult(result) {
-  console.log(`状态: ${result.status}`);
-  console.log(`页面: ${result.title || result.url}`);
+async function writeAndReportRunResult({
+  result,
+  outputMode
+}) {
+  const filePath = await writeRunResult({
+    result,
+    outputMode
+  });
+  console.error(`[aicrawler] Run result saved to ${filePath}`);
+}
 
-  if (result.status === "blocked") {
-    console.log(`原因: ${result.reason}`);
-    console.log(`信号: ${result.signals.join(", ")}`);
-    return;
-  }
-
-  if (result.mode === "crawl") {
-    console.log(`抓取页面数: ${result.pageCount}`);
-
-    for (const page of result.pages ?? []) {
-      console.log(
-        `- [${page.status}] depth=${page.depth} ${page.title || page.url}`
-      );
-    }
-
-    if (result.data !== undefined) {
-      console.log(JSON.stringify(result.data, null, 2));
-    }
-    return;
-  }
-
-  if (result.mode === "links") {
-    console.log(`链接数量: ${result.data?.count ?? 0}`);
-    console.log(JSON.stringify(result.data?.links ?? [], null, 2));
-    return;
-  }
-
-  if (typeof result.data === "string") {
-    console.log(result.data);
-    return;
-  }
-
-  console.log(JSON.stringify(result.data, null, 2));
+function printRunResult({
+  result,
+  outputMode
+}) {
+  console.log(
+    formatRunResult({
+      result,
+      outputMode
+    })
+  );
 }
 
 async function main() {
@@ -94,25 +82,48 @@ async function main() {
     baseUrl: config.readableMirrorBaseUrl,
     timeoutMs: config.readableMirrorTimeoutMs
   });
-  const fallbackSnapshotProvider = new CompositeSnapshotProvider([
-    directHttpProvider,
-    readableMirrorProvider
-  ]);
+  const fallbackSnapshotProvider =
+    argumentsObject.readableMirror || config.readableMirrorEnabled
+      ? new CompositeSnapshotProvider([
+          directHttpProvider,
+          readableMirrorProvider
+        ])
+      : directHttpProvider;
   let session = null;
+  let sessionError = null;
+  let browserWarningPrinted = false;
 
-  try {
-    session = await createPlaywrightSession({
-      navigationTimeoutMs: config.navigationTimeoutMs,
-      storageStatePath: config.storageStatePath,
-      browserExecutablePath: config.browserExecutablePath,
-      headless: !argumentsObject.headful
-    });
-  } catch (error) {
-    console.warn(
-      `[aicrawler] Browser session unavailable, falling back to HTTP snapshots: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
+  async function getSession() {
+    if (session) {
+      return session;
+    }
+
+    if (sessionError) {
+      throw sessionError;
+    }
+
+    try {
+      session = await createPlaywrightSession({
+        navigationTimeoutMs: config.navigationTimeoutMs,
+        storageStatePath: config.storageStatePath,
+        browserExecutablePath: config.browserExecutablePath,
+        headless: !argumentsObject.headful
+      });
+
+      return session;
+    } catch (error) {
+      sessionError =
+        error instanceof Error ? error : new Error(String(error));
+
+      if (!browserWarningPrinted) {
+        console.warn(
+          `[aicrawler] Browser session unavailable, falling back to HTTP snapshots: ${sessionError.message}`
+        );
+        browserWarningPrinted = true;
+      }
+
+      throw sessionError;
+    }
   }
 
   const aiClient = new OpenAiCompatibleAiClient({
@@ -129,6 +140,8 @@ async function main() {
   };
   const result = await runTaskWorkflow({
     session,
+    getSession,
+    initialSnapshotProvider: directHttpProvider,
     fallbackSnapshotProvider,
     aiClient,
     url: normalizedUrl,
@@ -148,18 +161,44 @@ async function main() {
     registry
   });
 
-  if (argumentsObject.outputMode === "text") {
-    printTextResult(result);
-  } else {
-    console.log(JSON.stringify(result, null, 2));
-  }
+  printRunResult({
+    result,
+    outputMode: argumentsObject.outputMode
+  });
+  await writeAndReportRunResult({
+    result,
+    outputMode: argumentsObject.outputMode
+  });
 
   if (result.status === "blocked") {
     process.exitCode = 2;
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
+main().catch(async (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+
+  try {
+    await writeAndReportRunResult({
+      result: {
+        status: "error",
+        url: "",
+        title: "",
+        mode: "cli_error",
+        tool: "cli_error",
+        data: {
+          message
+        },
+        confidence: null
+      },
+      outputMode: "text"
+    });
+  } catch (writeError) {
+    const writeErrorMessage =
+      writeError instanceof Error ? writeError.message : String(writeError);
+    console.error(`[aicrawler] Failed to save run result: ${writeErrorMessage}`);
+  }
+
   process.exitCode = 1;
 });

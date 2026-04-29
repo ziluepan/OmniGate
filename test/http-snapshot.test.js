@@ -63,6 +63,65 @@ test("DirectHttpSnapshotProvider fetches a public html page and extracts snapsho
     "https://blog.evalbug.com/archive",
     "https://blog.evalbug.com/about"
   ]);
+  assert.ok(
+    result.snapshot.sectionCandidates.some((candidate) =>
+      candidate.selector.startsWith("http-block:")
+    )
+  );
+});
+
+test("DirectHttpSnapshotProvider preserves code block indentation and drops gutter line numbers", async () => {
+  const provider = new DirectHttpSnapshotProvider(
+    {},
+    async () =>
+      new Response(
+        `<!doctype html>
+        <html lang="zh-CN">
+          <head>
+            <title>Code Article</title>
+          </head>
+          <body>
+            <article>
+              <h1>Code Article</h1>
+              <p>示例代码：</p>
+              <p>这一段只是为了让 article 区块长度足够进入候选列表。</p>
+              <figure class="highlight python">
+                <table>
+                  <tr>
+                    <td class="gutter">
+                      <pre>1
+2</pre>
+                    </td>
+                    <td class="code">
+                      <pre>if True:
+    print("hi")</pre>
+                    </td>
+                  </tr>
+                </table>
+              </figure>
+            </article>
+          </body>
+        </html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8"
+          }
+        }
+      )
+  );
+
+  const result = await provider.fetch({
+    url: "https://example.com/code-article"
+  });
+  const sections = await result.collectSections(["article"], {
+    maxTextLength: 4000
+  });
+
+  assert.equal(sections.length, 1);
+  assert.match(sections[0].text, /if True:\n    print\("hi"\)/u);
+  assert.doesNotMatch(sections[0].text, /\n1\n2\nif True:/u);
+  assert.match(result.snapshot.fullVisibleText, /if True:\n    print\("hi"\)/u);
 });
 
 test("CompositeSnapshotProvider falls through until a provider returns a snapshot", async () => {

@@ -63,13 +63,21 @@ function buildSnapshotSummary(snapshot) {
 }
 
 function buildStructurePrompts({ userQuery, snapshot, skillExtractStrategy }) {
+  const fullPageText = snapshot?.fullVisibleText ?? snapshot?.visibleText ?? "";
+  const analysisBodyText =
+    fullPageText.length > 80000
+      ? `${fullPageText.slice(0, 80000)}…`
+      : fullPageText;
   const systemLines = [
     "你是网页结构分析器。",
-    "只基于给定的页面摘要判断哪些区域最可能包含用户要的信息。",
+    "你会先阅读页面全文和候选区块，然后决定最小且最相关的提取范围。",
     "不要假设你能绕过登录、验证码或任何安全校验。",
-    "如果页面信息分散、摘要不足、或候选区块不可靠，可以自主选择 full_text，而不是被局部选择器限制。",
+    "优先返回能够覆盖目标内容的 targetSectionSelectors，只在无法可靠定位局部区块时才选择 full_text。",
+    "如果目标内容分散在多个相邻或互补区块，可以返回多个 targetSectionSelectors；如果单个区块足够，就只返回一个。",
+    "如果候选区块不可靠、页面仍像壳页，或局部区块拿不到目标内容，你可以自主选择 full_text。",
+    "targetSectionSelectors 可以来自页面候选区块里的 selector，也可以是提供给你的 block id。",
     "只输出 JSON，格式为：",
-    '{"targetSectionSelectors":["css selector"],"extractionMode":"sections|full_text","outputShape":"object|array|text","reason":"简短说明"}'
+    '{"targetSectionSelectors":["selector or block id"],"extractionMode":"sections|full_text","outputShape":"object|array|text","reason":"简短说明"}'
   ];
 
   // 注入 skill 的提取策略作为强提示
@@ -108,7 +116,9 @@ function buildStructurePrompts({ userQuery, snapshot, skillExtractStrategy }) {
     userPrompt: [
       `用户目标：${userQuery}`,
       "页面摘要：",
-      buildSnapshotSummary(snapshot)
+      buildSnapshotSummary(snapshot),
+      "页面全文（供你判断应该抓哪个区块）：",
+      analysisBodyText
     ].join("\n\n")
   };
 }
@@ -121,25 +131,36 @@ function buildExtractionPrompts({
   extractionPrompt
 }) {
   const fullBodyText = snapshot?.fullVisibleText ?? "";
+  const focusedSections = Array.isArray(sections)
+    ? sections.filter(
+        (section) =>
+          typeof section?.text === "string" && section.text.trim().length > 0
+      )
+    : [];
+  const hasFocusedSections = focusedSections.length > 0;
 
-  // 对于 full_text 模式的 text 输出（如小说章节），发送完整正文
+  // 对于 full_text 模式的 text 输出（如小说章节），尽量保留完整的聚焦正文。
   const isFullTextMode =
     plan?.extractionMode === "full_text" && plan?.outputShape === "text";
-
-  // 分段发送策略：每段最多 30K 字符，LLM 自行拼接
-  const maxChunkSize = isFullTextMode ? 120000 : 60000;
-  const bodyTextSnippet =
-    fullBodyText.length > maxChunkSize
-      ? `${fullBodyText.slice(0, maxChunkSize)}…`
+  const contextSnippetLimit = hasFocusedSections
+    ? 2000
+    : isFullTextMode
+      ? 60000
+      : 12000;
+  const contextSnippet =
+    fullBodyText.length > contextSnippetLimit
+      ? `${fullBodyText.slice(0, contextSnippetLimit)}…`
       : fullBodyText;
 
   const systemPromptLines = [
     "你是网页信息抽取器。",
     "根据用户目标，从提供的网页正文中完整提取结果，不要省略或截断任何内容。",
     "如果用户要小说内容，就把章节正文原样返回，不要总结、不要省略。",
+    "如果正文里包含代码块、引用、列表或其他依赖排版的内容，必须保留原有换行、缩进和相对顺序。",
     "如果内容不足，就尽量返回能确认的字段，不要编造。",
     "已选区块和场景提示只是辅助信息，不是硬约束。",
-    "如果区块不完整、提示不准确、或页面类型与预判不一致，以你的实际判断为准，并优先参考页面全文。",
+    "如果已经提供了聚焦区块，请优先基于这些区块完成提取，不要被整页噪声干扰。",
+    "如果区块不完整、提示不准确、或页面类型与预判不一致，以你的实际判断为准。",
     '只输出 JSON，格式为：{"answer": 数据提取结果, "confidence": 0.95, "notes": ["可选说明"]}',
     '注意：answer 字段的数据类型必须与 extraction plan 中的 outputShape 匹配。如果是 text，answer 就是一个长字符串；如果是 array，就是数组；否则是对象。',
     "对于 text 类型的 answer，请返回完整的原文内容，不要截断。"
@@ -171,9 +192,13 @@ function buildExtractionPrompts({
         2
       ),
       "已选区块（聚焦内容）：",
-      JSON.stringify(sections ?? [], null, 2),
-      "页面全文（可能包含导航/广告等噪声）：",
-      bodyTextSnippet
+      JSON.stringify(focusedSections, null, 2),
+      hasFocusedSections
+        ? "页面补充摘要（仅用于校验上下文，不代表整页都要提取）："
+        : "页面全文（可能包含导航/广告等噪声）：",
+      hasFocusedSections
+        ? truncateText(snapshot?.visibleText ?? fullBodyText, 2000)
+        : contextSnippet
     ].join("\n\n")
   };
 }
