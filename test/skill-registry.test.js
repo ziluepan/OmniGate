@@ -309,6 +309,38 @@ test("redirect verification skill detects login/404 pages", () => {
   assert.equal(detected.type, "redirect");
 });
 
+test("redirect verification skill does not flag article pages that merely contain login links", () => {
+  const detected = redirectVerificationSkill.detect({
+    title: "一世之尊-第732章 无耻小孟（求月票）-69书吧",
+    headings: ["第732章 无耻小孟（求月票）"],
+    visibleText:
+      "首页 登录 注册\n第732章 无耻小孟（求月票）\n这是正文第一段。\n这是正文第二段。",
+    fullVisibleText:
+      "首页 登录 注册\n\n第732章 无耻小孟（求月票）\n\n这是正文第一段。\n\n这是正文第二段。",
+    sectionCandidates: [
+      {
+        selector: "article",
+        textSample: "这是正文第一段。"
+      }
+    ]
+  });
+
+  assert.equal(detected.blocked, false);
+});
+
+test("redirect verification skill still flags thin login walls even if the title looks normal", () => {
+  const detected = redirectVerificationSkill.detect({
+    title: "一世之尊-第732章 无耻小孟（求月票）-69书吧",
+    headings: ["第732章 无耻小孟（求月票）"],
+    visibleText: "请先登录后继续阅读本章内容。",
+    fullVisibleText: "请先登录后继续阅读本章内容。",
+    sectionCandidates: []
+  });
+
+  assert.equal(detected.blocked, true);
+  assert.equal(detected.type, "redirect");
+});
+
 test("SkillRegistry.detectVerification returns CF verification for CF pages", () => {
   const registry = new SkillRegistry();
 

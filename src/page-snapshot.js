@@ -4,7 +4,17 @@ async function safeEvaluate(page, fn, ...args) {
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      return await page.evaluate(fn, ...args);
+      if (args.length === 0) {
+        return await page.evaluate(fn);
+      }
+
+      if (args.length === 1) {
+        return await page.evaluate(fn, args[0]);
+      }
+
+      throw new Error(
+        "safeEvaluate only supports zero or one serializable argument."
+      );
     } catch (error) {
       lastError = error;
       if (
@@ -223,7 +233,7 @@ export async function capturePageSnapshot(page) {
 }
 
 export async function collectSectionsBySelectors(page, selectors, options = {}) {
-  return safeEvaluate(page, (rawSelectors, rawOptions) => {
+  return safeEvaluate(page, ({ selectors: rawSelectors, options: rawOptions }) => {
     function truncate(rawText, maxLength) {
       return rawText.length <= maxLength
         ? rawText
@@ -319,7 +329,10 @@ export async function collectSectionsBySelectors(page, selectors, options = {}) 
         return [];
       }
     });
-  }, selectors, options);
+  }, {
+    selectors,
+    options
+  });
 }
 
 export async function dismissNuisanceOverlays(page) {
